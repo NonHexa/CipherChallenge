@@ -440,3 +440,21 @@ def letter_to_number(letter):
 def number_to_letter(number):
     """Convert a number back to a letter (1=a, ..., 26=z)."""
     return chr((number - 1) % 26 + ord('a'))
+
+def clean_text(text):
+    chars="abcdefghijklmnopqrstuvwxyz"
+    text = ""
+    print("Enter your lines of text (type BREAK on an empty line to finish):")
+    while True:
+        line = input()
+        if line == "BREAK":
+            break
+        text += line
+    text=text.lower()
+    text2=""
+    for i in range(0,len(text)):
+        if text[i] in chars:
+            text2+=text[i]
+        else:
+            pass
+    return text2
