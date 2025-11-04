@@ -1,9 +1,12 @@
 from collections import Counter
+from pathlib import Path
 import math
 import random
-
+from itertools import permutations, chain
+import re
 import random
 import string
+from multiprocessing import Pool
 
 def generate_random_key():
     alphabet = list(string.ascii_lowercase)
@@ -58,7 +61,8 @@ def english_detect_numVar(message, crib, spaces,total_iterations):
             if target_percentage - 2 <= percentage_dict[bigram] <= target_percentage + 2:
                 precision += 5
     #precision += sum(crib.count(message) * 200 for _ in crib)
-    word_list_file = "Oxford 3000 Word List No Spaces.txt" if spaces == "f" else "Oxford 3000 Word List.txt"
+    root_dir = Path(__file__).parent
+    word_list_file = root_dir / 'Oxford 3000 Word List No Spaces.txt' if spaces == "f" else root_dir / 'Oxford 3000 Word List.txt'
     word_set = load_word_list(word_list_file)
     n = 4  # Length of n-grams to check
     ngrams = [message[i:i+n] for i in range(len(message) - n + 1)]
@@ -339,10 +343,318 @@ def english_detect(message,precision_percentage):
         return True
     else:
         return False
-    
-def columnar_transposition():
-    pass
+ENGLISH_FREQ = {
+    'A': 0.08167, 'B': 0.01492, 'C': 0.02782, 'D': 0.04253, 'E': 0.12702, 'F': 0.02228,
+    'G': 0.02015, 'H': 0.06094, 'I': 0.06966, 'J': 0.00153, 'K': 0.00772, 'L': 0.04025,
+    'M': 0.02406, 'N': 0.06749, 'O': 0.07507, 'P': 0.01929, 'Q': 0.00095, 'R': 0.05987,
+    'S': 0.06327, 'T': 0.09056, 'U': 0.02758, 'V': 0.00978, 'W': 0.02360, 'X': 0.00150,
+    'Y': 0.01974, 'Z': 0.00074
+}
 
+COMMON_WORDS = set("""
+the be to of and a in that have I it for not on with he as you do at
+this but his by from they we say her she or an will my one all would there
+their what so up out if about who get which go me when make can like time no
+just him know take people into year your good some could them see other than
+then now look only come its over think also back after use two how our work first
+well way even new want because any these give day most us
+""".split())
+
+# === New scoring system ===
+def chi_squared_english(text):
+    text = re.sub(r'[^A-Z]', '', text.upper())
+    if len(text) < 20:
+        return 1000
+    count = Counter(text)
+    total = sum(count.values())
+    chi = 0
+    for letter, freq in ENGLISH_FREQ.items():
+        observed = count.get(letter, 0)
+        expected = freq * total
+        chi += ((observed - expected) ** 2) / (expected + 1e-6)
+    return chi
+
+def word_score(text):
+    words = re.findall(r"[A-Za-z]{2,}", text.lower())
+    if not words:
+        return 0
+    matches = sum(1 for w in words if w in COMMON_WORDS)
+    return matches / len(words)
+
+def quadgram_score(text):
+    """Simple quadgram scoring using log probabilities."""
+    from math import log10
+    text = re.sub(r'[^A-Z]', '', text.upper())
+    if len(text) < 4:
+        return -9999
+    # frequencies derived from English corpus (subset)
+    QUADGRAMS = {
+        "TION": 0.0015, "THER": 0.0014, "HERE": 0.0012, "OULD": 0.0010,
+        "IGHT": 0.0010, "HAVE": 0.0009, "WITH": 0.0008, "HATI": 0.0007,
+        "MENT": 0.0007, "TION": 0.0015, "IONS": 0.0006, "EDTH": 0.0006
+    }
+    total_score = 0
+    for i in range(len(text) - 3):
+        q = text[i:i+4]
+        total_score += log10(QUADGRAMS.get(q, 1e-7))
+    return total_score / len(text)
+
+def hybrid_english_score(text, crib=None, spaces="f", include_old=False):
+    """Combines multiple ranking methods with adjusted scaling."""
+    chi = min(chi_squared_english(text), 1000)  # Cap chi-squared
+    wscore = word_score(text)
+    qscore = quadgram_score(text)
+    
+    # Adjust the formula to prevent large negative scores
+    base_score = (wscore * 100) + ((qscore + 10) * 50) - (chi * 0.01)
+    
+    # Add crib bonus
+    if crib and crib.lower() in text.lower():
+        base_score += 50
+        
+    return max(base_score, 0)  # Ensure score is never negative
+
+def test_key_length(args):
+    """Pickle-safe test function: tries both decrypt interpretations for each permutation."""
+    key_len, ciphertext, crib, spaces = args
+    local_best = (float('-inf'), None, None)
+    for perm in permutations(range(key_len)):
+        # try interpretation A (perm: chunk_index -> dest_col)
+        pt_a = columnar_transposition_decrypt(ciphertext, perm)
+        # try interpretation B (perm: col_index -> rank)
+        pt_b = columnar_transposition_decrypt_inverse(ciphertext, perm)
+        for plaintext in (pt_a, pt_b):
+            if crib and crib.lower() not in plaintext.lower():
+                # Keep trying — don't aggressively discard all candidates
+                pass
+            quick_score = chi_squared_english(plaintext)
+            if quick_score > 900:
+                continue
+            score = hybrid_english_score(plaintext, crib, spaces)
+            if score > local_best[0]:
+                local_best = (score, perm, plaintext)
+        # early stop if very good
+        if local_best[0] > 300:
+            return local_best
+    return local_best
+
+def columnar_transposition_decrypt(ciphertext, key, nulls_used=False):
+    ciphertext = str(ciphertext)
+    N = len(ciphertext)
+    cols = len(key)
+    if cols == 0:
+        return ""
+    if nulls_used:
+        # exact division expected
+        rows = N // cols
+        col_lengths = [rows] * cols
+    else:
+        rows = math.ceil(N / cols)
+        cells = rows * cols
+        num_nulls = cells - N  # number of missing cells in final row
+        # columns with index >= cols - num_nulls are short (have rows-1 chars)
+        col_lengths = [rows if i < cols - num_nulls else rows - 1 for i in range(cols)]
+    columns = [""] * cols
+    pos = 0
+    # ciphertext chunks appear in order of increasing chunk_index (0..cols-1)
+    for chunk_index in range(cols):
+        dest_col = key[chunk_index]
+        length = col_lengths[dest_col]
+        if length > 0:
+            columns[dest_col] = ciphertext[pos:pos+length]
+            pos += length
+        else:
+            columns[dest_col] = ""
+    # read row-wise to reconstruct plaintext
+    out = []
+    for r in range(rows):
+        for c in range(cols):
+            col_text = columns[c]
+            if r < len(col_text):
+                out.append(col_text[r])
+    return "".join(out)
+
+def columnar_transposition_decrypt_inverse(ciphertext, key, nulls_used=False):
+    ciphertext = str(ciphertext)
+    N = len(ciphertext)
+    cols = len(key)
+    if cols == 0:
+        return ""
+    if nulls_used:
+        rows = N // cols
+        col_lengths = [rows] * cols
+    else:
+        rows = math.ceil(N / cols)
+        cells = rows * cols
+        num_nulls = cells - N
+        col_lengths = [rows if i < cols - num_nulls else rows - 1 for i in range(cols)]
+    # build rank->column mapping: rank_to_col[rank] = col_index
+    rank_to_col = [None] * cols
+    for col_idx, rank in enumerate(key):
+        rank_to_col[rank] = col_idx
+    columns = [""] * cols
+    pos = 0
+    for rank in range(cols):
+        col_idx = rank_to_col[rank]
+        length = col_lengths[col_idx]
+        if length > 0:
+            columns[col_idx] = ciphertext[pos:pos+length]
+            pos += length
+        else:
+            columns[col_idx] = ""
+    out = []
+    for r in range(rows):
+        for c in range(cols):
+            col_text = columns[c]
+            if r < len(col_text):
+                out.append(col_text[r])
+    return "".join(out)
+
+def columnar_transposition(ciphertext, max_key_length, crib, spaces, brute_precision):
+    best_score = float('-inf')
+    best_plaintext = None
+    best_meta = None
+
+    root_dir = Path(__file__).parent
+    word_list_file = root_dir / 'Oxford 3000 Word List No Spaces.txt' if spaces == "f" else root_dir / 'Oxford 3000 Word List.txt'
+    word_set = load_word_list(word_list_file)
+
+    max_key_length = 10 if max_key_length == 0 else max(2, min(max_key_length, 12))
+    print(f"Testing key lengths 2-{max_key_length}...")
+
+    def score_text(text):
+        # dictionary matches (3+ letter words)
+        words = re.findall(r"[A-Za-z]{3,}", text.lower())
+        word_matches = sum(1 for w in words if w in word_set)
+        ngram_score = hybrid_english_score(text, crib, spaces)
+        markov_score = english_detect_numVar(text, crib, spaces, 1)
+        total = (word_matches * 25) + ngram_score + markov_score
+        return total
+
+    for key_len in range(2, max_key_length + 1):
+        print(f"\nTesting length {key_len}")
+        for perm in permutations(range(key_len)):
+            # try both nulls handling and both permutation interpretations
+            for nulls_used in (True, False):
+                # interpretation A: perm maps ciphertext-chunk_index -> dest_col
+                pt_a = columnar_transposition_decrypt(ciphertext, perm, nulls_used=nulls_used)
+                score_a = score_text(pt_a)
+                if score_a > best_score:
+                    best_score = score_a
+                    best_plaintext = pt_a
+                    best_meta = ("chunk->dest", key_len, perm, nulls_used)
+                    print(f"New best {best_score:.1f} ({best_meta})\n{pt_a[:120]}...")
+                if brute_precision and score_a >= brute_precision:
+                    print("Reached brute_precision -> returning best candidate.")
+                    return best_plaintext
+                # interpretation B: perm maps col_index -> rank
+                pt_b = columnar_transposition_decrypt_inverse(ciphertext, perm, nulls_used=nulls_used)
+                score_b = score_text(pt_b)
+                if score_b > best_score:
+                    best_score = score_b
+                    best_plaintext = pt_b
+                    best_meta = ("col->rank", key_len, perm, nulls_used)
+                    print(f"New best {best_score:.1f} ({best_meta})\n{pt_b[:120]}...")
+                if brute_precision and score_b >= brute_precision:
+                    print("Reached brute_precision -> returning best candidate.")
+                    return best_plaintext
+
+    print(f"\nBest result meta: {best_meta} score={best_score:.1f}")
+    return best_plaintext
+
+def _apply_perm_to_blocks(ciphertext, perm, block_len, pad_char=' '):
+    N = len(ciphertext)
+    blocks = [ciphertext[i:i+block_len] for i in range(0, N, block_len)]
+    out_chars = []
+    for blk in blocks:
+        if len(blk) < block_len:
+            blk = blk + pad_char * (block_len - len(blk))
+        # build plaintext block according to perm
+        pb = [''] * block_len
+        for pi in range(block_len):
+            cp = perm[pi]
+            # guard cp bounds
+            if cp < len(blk):
+                pb[pi] = blk[cp]
+            else:
+                pb[pi] = pad_char
+        out_chars.extend(pb)
+    return "".join(out_chars)
+
+def block_permutation_transposition(ciphertext, max_block_len, crib, spaces, brute_precision=0):
+    root_dir = Path(__file__).parent
+    word_list_file = root_dir / 'Oxford 3000 Word List No Spaces.txt' if spaces == "f" else root_dir / 'Oxford 3000 Word List.txt'
+    word_set = load_word_list(word_list_file)
+
+    max_block_len = 10 if max_block_len == 0 else max(2, min(max_block_len, 12))
+    best_score = float('-inf')
+    best_plain = None
+    best_meta = None
+
+    def score_text(text):
+        words = re.findall(r"[A-Za-z]{3,}", text.lower())
+        word_matches = sum(1 for w in words if w in word_set)
+        ngram_score = hybrid_english_score(text, crib, spaces)
+        markov_score = english_detect_numVar(text, crib, spaces, 1)
+        return (word_matches * 25) + ngram_score + markov_score
+
+    for block_len in range(2, max_block_len + 1):
+        print(f"Trying block length {block_len}...")
+        # exhaustive for small block sizes
+        if block_len <= 6:
+            for perm in permutations(range(block_len)):
+                pt = _apply_perm_to_blocks(ciphertext, perm, block_len, pad_char=' ')
+                sc = score_text(pt)
+                if sc > best_score:
+                    best_score = sc
+                    best_plain = pt
+                    best_meta = ("exhaustive", block_len, perm)
+                    print(f"New best {best_score:.1f} {best_meta} -> {pt[:120]}...")
+                if brute_precision and sc >= brute_precision:
+                    print("Reached brute precision -> returning best candidate.")
+                    return best_plain
+        else:
+            # hillclimbing for larger block sizes
+            import time
+            def hillclimb(initial_perm, attempts=2000):
+                perm = list(initial_perm)
+                cur_plain = _apply_perm_to_blocks(ciphertext, perm, block_len, pad_char=' ')
+                cur_score = score_text(cur_plain)
+                best_local = (cur_score, perm[:], cur_plain)
+                it = 0
+                while it < attempts:
+                    a, b = random.sample(range(block_len), 2)
+                    perm[a], perm[b] = perm[b], perm[a]
+                    cand_plain = _apply_perm_to_blocks(ciphertext, perm, block_len, pad_char=' ')
+                    cand_score = score_text(cand_plain)
+                    if cand_score > cur_score:
+                        cur_score = cand_score
+                        cur_plain = cand_plain
+                        if cand_score > best_local[0]:
+                            best_local = (cand_score, perm[:], cand_plain)
+                    else:
+                        # revert swap with some small probability (simple hillclimb: revert)
+                        perm[a], perm[b] = perm[b], perm[a]
+                    it += 1
+                return best_local
+
+            # multiple random restarts
+            restarts = 20
+            for r in range(restarts):
+                start = list(range(block_len))
+                random.shuffle(start)
+                local_best_score, local_perm, local_plain = hillclimb(start, attempts=3000)
+                if local_best_score > best_score:
+                    best_score = local_best_score
+                    best_plain = local_plain
+                    best_meta = ("hillclimb", block_len, tuple(local_perm))
+                    print(f"New best {best_score:.1f} {best_meta} -> {best_plain[:120]}...")
+                if brute_precision and local_best_score >= brute_precision:
+                    print("Reached brute precision -> returning best candidate.")
+                    return best_plain
+
+    print(f"Best meta: {best_meta} score={best_score:.1f}")
+    return best_plain
 def space_remover(text):
     output=""
     for i in range(len(text)):
